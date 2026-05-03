@@ -1,0 +1,124 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+
+// ─── Configuration ───────────────────────────────────────────
+const char* ssid       = "YOUR_WIFI";
+const char* password   = "YOUR_PASSWORD";
+const char* serverName = "http://YOUR_SERVER_IP:5000/data";
+
+// ─── Pin Definitions ─────────────────────────────────────────
+const int currentPin = 34;
+const int voltagePin = 35;
+
+// ─── Sensor Calibration ──────────────────────────────────────
+// Voltage divider: maps 0–25V input → 0–3.3V on ADC pin
+const float VOLTAGE_MAX     = 25.0;
+
+// ACS712-10A: 0A = ~2.5V midpoint, sensitivity = 100mV/A
+// At 3.3V reference: midpoint raw ≈ 2048 (half of 4095)
+const float CURRENT_MIDPOINT = 2048.0;  // raw ADC at 0A
+const float CURRENT_SENS     = 0.1;     // V per Amp (100mV/A for ACS712-10A)
+const float VREF             = 3.3;     // ESP32 ADC reference voltage
+
+// ─── Globals ─────────────────────────────────────────────────
+float voltage = 0;
+float current = 0;
+float power   = 0;
+
+// ─── WiFi Connect Helper ─────────────────────────────────────
+void connectWiFi() {
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(ssid, password);
+
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected! IP: " + WiFi.localIP().toString());
+  } else {
+    Serial.println("\nFailed to connect. Will retry in loop.");
+  }
+}
+
+// ─── Setup ───────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  connectWiFi();
+}
+
+// ─── Main Loop ───────────────────────────────────────────────
+void loop() {
+  // --- Read ADC (average 10 samples to reduce noise) ---
+  long voltageRawSum = 0;
+  long currentRawSum = 0;
+
+  for (int i = 0; i < 10; i++) {
+    voltageRawSum += analogRead(voltagePin);
+    currentRawSum += analogRead(currentPin);
+    delay(10);
+  }
+
+  float voltageRaw = voltageRawSum / 10.0;
+  float currentRaw = currentRawSum / 10.0;
+
+  // --- Scale readings ---
+  // Voltage: ADC 0–4095 maps to 0–VOLTAGE_MAX
+  voltage = (voltageRaw / 4095.0) * VOLTAGE_MAX;
+
+  // Current: ACS712 centered at midpoint; convert deviation to amps
+  float currentVolts = ((currentRaw - CURRENT_MIDPOINT) / 4095.0) * VREF;
+  current = currentVolts / CURRENT_SENS;
+  if (current < 0) current = 0;  // clamp negative noise to 0
+
+  // Power
+  power = voltage * current;
+
+  // --- Serial Monitor ---
+  Serial.println("─────────────────────────");
+  Serial.print("Voltage : "); Serial.print(voltage, 2); Serial.println(" V");
+  Serial.print("Current : "); Serial.print(current, 2); Serial.println(" A");
+  Serial.print("Power   : "); Serial.print(power,   2); Serial.println(" W");
+
+  // --- Reconnect WiFi if dropped ---
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi lost. Reconnecting...");
+    WiFi.disconnect();
+    connectWiFi();
+  }
+
+  // --- Send data to server ---
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    http.begin(serverName);
+    http.addHeader("Content-Type", "application/json");
+
+    // Build JSON safely using char buffers (avoids float precision issues)
+    char vStr[8], cStr[8], pStr[8];
+    dtostrf(voltage, 4, 2, vStr);
+    dtostrf(current, 4, 2, cStr);
+    dtostrf(power,   6, 2, pStr);
+
+    String jsonData = String("{\"voltage\":") + vStr +
+                      ",\"current\":"         + cStr +
+                      ",\"power\":"           + pStr + "}";
+
+    int httpResponseCode = http.POST(jsonData);
+
+    if (httpResponseCode > 0) {
+      Serial.print("Server response: ");
+      Serial.println(httpResponseCode);
+    } else {
+      Serial.print("POST failed, error: ");
+      Serial.println(http.errorToString(httpResponseCode));
+    }
+
+    http.end();
+  }
+
+  delay(5000);
+}
